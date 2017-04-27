@@ -15,8 +15,13 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
     const ACTION_UPDATE = 'update';
     const ACTION_SUBMIT = 'submit';
     const ACTION_CANCEL = 'cancel';
+    const ACTION_REFUND = 'refund';
+    const ACTION_FULFILL = 'fulfill';
+    const ACTION_CHECKOUT_CREATE = 'checkout_create';
+    const ACTION_CHECKOUT_DENIED = 'checkout_denied';
 
     private $_customer = array();
+    protected $requestData = array();
 
     public function __construct()
     {
@@ -84,22 +89,38 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
                 case self::ACTION_CREATE:
                     $orderForTransport = $this->getOrder($order);
                     $response = $transport->createOrder($orderForTransport);
-
+                    $order->setIsSentToRiskfied(1);
+                    $order->save();
                     break;
                 case self::ACTION_UPDATE:
                     $orderForTransport = $this->getOrder($order);
                     $response = $transport->updateOrder($orderForTransport);
-
                     break;
                 case self::ACTION_SUBMIT:
                     $orderForTransport = $this->getOrder($order);
                     $response = $transport->submitOrder($orderForTransport);
-
                     break;
                 case self::ACTION_CANCEL:
                     $orderForTransport = $this->getOrderCancellation($order);
                     $response = $transport->cancelOrder($orderForTransport);
-
+                    break;
+                case self::ACTION_REFUND:
+                    $orderForTransport = $this->getOrderRefund($order);
+                    $response = $transport->refundOrder($orderForTransport);
+                    break;
+                case self::ACTION_FULFILL:
+                    $orderForTransport = $this->getOrderFulfillments($order);
+                    $response = $transport->fulfillOrder($orderForTransport);
+                    break;
+                case self::ACTION_CHECKOUT_CREATE:
+                    $checkoutForTransport = new Model\Checkout($order);
+                    $response = $transport->createCheckout($checkoutForTransport);
+                    Mage::log(var_export($this->requestData, true), null, 'riskified-request-data.log');
+                    break;
+                case self::ACTION_CHECKOUT_DENIED:
+                    $checkoutForTransport = new Model\Checkout($order);
+                    $response = $transport->deniedCheckout($checkoutForTransport);
+                    Mage::log(var_export($this->requestData, true), null, 'riskified-request-data.log');
                     break;
             }
 
@@ -124,7 +145,20 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
             );
 
             throw $curlException;
-        } catch (Exception $e) {
+        }
+        catch (\Riskified\OrderWebhook\Exception\MalformedJsonException $e) {
+            if (strstr($e->getMessage(), "504") && strstr($e->getMessage(), "Status Code:")) {
+                $this->updateOrder($order, 'error', null, 'Error transferring order data to Riskified');
+                $this->scheduleSubmissionRetry($order, $action);
+            }
+            Mage::dispatchEvent(
+                'riskified_decider_post_order_error',
+                $eventData
+            );
+            throw $e;
+        }
+        catch (Exception $e) {
+            Mage::log(var_export($this->requestData, true), null, 'riskified-request-data.log');
             Mage::helper('full/log')->logException($e);
             Mage::getSingleton('adminhtml/session')->addError('Riskified extension: ' . $e->getMessage());
 
@@ -143,7 +177,9 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
     {
         $orders = array();
         foreach ($models as $model) {
-            $orders[] = $this->getOrder($model);
+            $order = $this->getOrder($model);
+            Mage::getModel('full/sent')->setOrderId($model->getId())->save();
+            $orders[] = $order;
         }
 
         $msgs = $this->getTransport()->sendHistoricalOrders($orders);
@@ -170,6 +206,7 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
      */
     public function updateOrder($order, $status, $oldStatus, $description)
     {
+
         Mage::helper('full/log')->log('Dispatching event for order ' . $order->getId() . ' with status "' . $status .
             '" old status "' . $oldStatus . '" and description "' . $description . '"');
 
@@ -224,6 +261,27 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
         return $order->getId() . '_' . $order->getIncrementId();
     }
 
+    // similar of method in ResponseController.php for now
+    private function loadOrderByOrigId($full_orig_id)
+    {
+        if (!$full_orig_id) {
+            return null;
+        }
+        $magento_ids = explode("_", $full_orig_id);
+        $order_id = $magento_ids[0];
+        $increment_id = null;
+        if (count($magento_ids) > 1) {
+          $increment_id = $magento_ids[1];
+        }
+        if ($order_id && $increment_id) {
+            return Mage::getModel('sales/order')->getCollection()
+                ->addFieldToFilter('entity_id', $order_id)
+                ->addFieldToFilter('increment_id', $increment_id)
+                ->getFirstItem();
+        }
+        return Mage::getModel('sales/order')->load($order_id);
+    }
+
     private $version;
 
     private function initSdk()
@@ -248,7 +306,28 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
     {
         $transport = new Transport\CurlTransport(new Signature\HttpDataSignature());
         $transport->timeout = 15;
+
+        $transport->requestData = &$this->requestData;
+
         return $transport;
+    }
+
+    private function getOrderRefund($model)
+    {
+        $order = $this->loadOrderByOrigId($model['id']);
+        $orig_id = $this->getOrderOrigId($order);
+        if (!$orig_id) {
+            return null;
+        }
+
+        $orderRefund = new Model\Refund(array_filter(array(
+            'id' => $orig_id,
+            'refunds' => $model['refunds']
+        )));
+
+        Mage::helper('full/log')->log("getOrderRefund(): " . PHP_EOL . json_encode(json_decode($orderRefund->toJson())));
+
+        return $orderRefund;
     }
 
     private function getOrderCancellation($model)
@@ -264,15 +343,56 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
         return $orderCancellation;
     }
 
+    /**
+     * Method creates shipment information needed to update order shipment
+     * @param $model
+     * @return Model\Fulfillment
+     *
+     * @api http://apiref.riskified.com/curl/#actions-fulfill
+     */
+    protected function getOrderFulfillments($model)
+    {
+        $fulfillments = array();
+
+        foreach ($model->getShipmentsCollection() as $shipment) {
+            $tracking = $shipment->getTracksCollection()->getFirstItem();
+            $comment = $shipment->getCommentsCollection()->getFirstItem();
+            $payload = array(
+                "fulfillment_id" => $shipment->getIncrementId(),
+                "created_at" => $this->formatDateAsIso8601($shipment->getCreatedAt()),
+                "status" => "success",
+                "tracking_company" => $tracking->getTitle(),
+                "tracking_numbers" => $tracking->getTrackNumber(),
+                "message" => $comment->getComment(),
+                "line_items" => $this->getAllLineItems($shipment)
+            );
+
+            $fulfillments[] = new Model\FulfillmentDetails(array_filter($payload));
+        }
+
+
+        $orderFulfillments = new Model\Fulfillment(array_filter(array(
+            'id' => $this->getOrderOrigId($model),
+            'fulfillments' => $fulfillments,
+        )));
+
+        Mage::helper('full/log')->log("getOrderFulfillments(): " . PHP_EOL . json_encode(json_decode($orderFulfillments->toJson())));
+
+        return $orderFulfillments;
+    }
+
     private function getOrder($model)
     {
         $gateway = 'unavailable';
+        $currentStore = Mage::app()->getStore();
+
         if ($model->getPayment()) {
             $gateway = $model->getPayment()->getMethod();
         }
 
         $order_array = array(
             'id' => $this->getOrderOrigId($model),
+            'checkout_id' => $model->getQuoteId(),
             'name' => $model->getIncrementId(),
             'email' => $model->getCustomerEmail(),
             'created_at' => $this->formatDateAsIso8601($model->getCreatedAt()),
@@ -301,12 +421,18 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
             unset($order_array['cart_token']);
         }
 
+        if ($currentStore->isAdmin()) {
+            $order_array['cart_token'] = null;
+        }
+
         $order = new Model\Order(array_filter($order_array, 'strlen'));
 
         $order->customer = $this->getCustomer($model);
         $order->shipping_address = $this->getShippingAddress($model);
         $order->billing_address = $this->getBillingAddress($model);
-        $order->payment_details = $this->getPaymentDetails($model);
+
+        $orderPaymentHelper = Mage::helper('full/order_payment');
+        $order->payment_details = $orderPaymentHelper->getPaymentDetails($model);
         $order->line_items = $this->getLineItems($model);
         $order->shipping_lines = $this->getShippingLines($model);
 
@@ -372,274 +498,71 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
         return $this->getAddress($mageAddr);
     }
 
-    private function logPaymentData($model)
-    {
-        Mage::helper('full/log')->log("Payment info debug Logs:");
-        try {
-            $payment = $model->getPayment();
-            $gatewayName = $payment->getMethod();
-            Mage::helper('full/log')->log("Payment Gateway: " . $gatewayName);
-            Mage::helper('full/log')->log("payment->getCcLast4(): " . $payment->getCcLast4());
-            Mage::helper('full/log')->log("payment->getCcType(): " . $payment->getCcType());
-            Mage::helper('full/log')->log("payment->getCcCidStatus(): " . $payment->getCcCidStatus());
-            Mage::helper('full/log')->log("payment->getCcAvsStatus(): " . $payment->getCcAvsStatus());
-            Mage::helper('full/log')->log("payment->getAdditionalInformation(): " . PHP_EOL . var_export($payment->getAdditionalInformation(), 1));
-
-
-            Mage::helper('full/log')->log("payment->getAdyenPspReference(): " . $payment->getAdyenPspReference());
-            Mage::helper('full/log')->log("payment->getAdyenKlarnaNumber(): " . $payment->getAdyenKlarnaNumber());
-            Mage::helper('full/log')->log("payment->getAdyenAvsResult(): " . $payment->getAdyenAvsResult());
-            Mage::helper('full/log')->log("payment->getAdyenCvcResult(): " . $payment->getAdyenCvcResult());
-            Mage::helper('full/log')->log("payment->getAdyenBoletoPaidAmount(): " . $payment->getAdyenBoletoPaidAmount());
-            Mage::helper('full/log')->log("payment->getAdyenTotalFraudScore(): " . $payment->getAdyenTotalFraudScore());
-            Mage::helper('full/log')->log("payment->getAdyenRefusalReasonRaw(): " . $payment->getAdyenRefusalReasonRaw());
-            Mage::helper('full/log')->log("payment->getAdyenAcquirerReference(): " . $payment->getAdyenAcquirerReference());
-            Mage::helper('full/log')->log("(possibly BIN?) payment->getAdyenAuthCode(): " . $payment->getAdyenAuthCode());
-
-            Mage::helper('full/log')->log("payment->getInfo(): " . PHP_EOL . var_export($payment->getInfo(), 1));
-
-            # paypal_avs_code,paypal_cvv2_match,paypal_fraud_filters,avs_result,cvv2_check_result,address_verification,
-            # postcode_verification,payment_status,pending_reason,payer_id,payer_status,email,credit_card_cvv2,
-            # cc_avs_status,cc_approval,cc_last4,cc_owner,cc_exp_month,cc_exp_year,
-            $sage = $model->getSagepayInfo();
-            if (is_object($sage)) {
-                #####,postcode_result,avscv2,address_status,payer_status
-                Mage::helper('full/log')->log("sagepay->getLastFourDigits(): " . $sage->getLastFourDigits());
-                Mage::helper('full/log')->log("sagepay->last_four_digits: " . $sage->getData('last_four_digits'));
-                Mage::helper('full/log')->log("sagepay->getCardType(): " . $sage->getCardType());
-                Mage::helper('full/log')->log("sagepay->card_type: " . $sage->getData('card_type'));
-                Mage::helper('full/log')->log("sagepay->getAvsCv2Status: " . $sage->getAvsCv2Status());
-                Mage::helper('full/log')->log("sagepay->address_result: " . $sage->getData('address_result'));
-                Mage::helper('full/log')->log("sagepay->getCv2result: " . $sage->getCv2result());
-                Mage::helper('full/log')->log("sagepay->cv2result: " . $sage->getData('cv2result'));
-                Mage::helper('full/log')->log("sagepay->getAvscv2: " . $sage->getAvscv2());
-                Mage::helper('full/log')->log("sagepay->getAddressResult: " . $sage->getAddressResult());
-                Mage::helper('full/log')->log("sagepay->getPostcodeResult: " . $sage->getPostcodeResult());
-                Mage::helper('full/log')->log("sagepay->getDeclineCode: " . $sage->getDeclineCode());
-                Mage::helper('full/log')->log("sagepay->getBankAuthCode: " . $sage->getBankAuthCode());
-                Mage::helper('full/log')->log("sagepay->getPayerStatus: " . $sage->getPayerStatus());
-            }
-            if ($gatewayName == "optimal_hosted") {
-                $optimalTransaction = unserialize($payment->getAdditionalInformation('transaction'));
-                if ($optimalTransaction) {
-                    Mage::helper('full/log')->log("Optimal transaction: ");
-                    Mage::helper('full/log')->log("transaction->cvdVerification: " . $optimalTransaction->cvdVerification);
-                    Mage::helper('full/log')->log("transaction->houseNumberVerification: " . $optimalTransaction->houseNumberVerification);
-                    Mage::helper('full/log')->log("transaction->zipVerification: " . $optimalTransaction->zipVerification);
-                } else {
-                    Mage::helper('full/log')->log("Optimal gateway but no transaction found");
-                }
-            }
-
-        } catch (Exception $e) {
-            Mage::helper('full/log')->logException($e);
-        }
-    }
-
-    private function getPaymentDetails($model)
-    {
-        $payment = $model->getPayment();
-        if (!$payment) {
-            return null;
-        }
-
-        if (Mage::helper('full')->isDebugLogsEnabled()) {
-            $this->logPaymentData($model);
-        }
-
-        $transactionId = $payment->getTransactionId();
-
-        $gatewayName = $payment->getMethod();
-
-        try {
-            switch ($gatewayName) {
-                case 'authorizenet':
-                    $authorize_data = $payment->getAdditionalInformation('authorize_cards');
-                    if ($authorize_data && is_array($authorize_data)) {
-                        $cards_data = array_values($authorize_data);
-                        if ($cards_data && $cards_data[0]) {
-                            $card_data = $cards_data[0];
-                            if (isset($card_data['cc_last4'])) {
-                                $creditCardNumber = $card_data['cc_last4'];
-                            }
-                            if (isset($card_data['cc_type'])) {
-                                $creditCardCompany = $card_data['cc_type'];
-                            }
-                            if (isset($card_data['cc_avs_result_code'])) {
-                                $avsResultCode = $card_data['cc_avs_result_code'];
-                            }// getAvsResultCode
-                            if (isset($card_data['cc_response_code'])) {
-                                $cvvResultCode = $card_data['cc_response_code'];
-                            } // getCardCodeResponseCode
-                        }
-                    }
-                    break;
-                case 'authnetcim':
-                    $avsResultCode = $payment->getAdditionalInformation('avs_result_code');
-                    $cvvResultCode = $payment->getAdditionalInformation('card_code_response_code');
-                    #$cavv_result_code = $payment->getAdditionalInformation('cavv_response_code');
-                    #$is_fraud = $payment->getAdditionalInformation('is_fraud');
-                    break;
-                case 'optimal_hosted':
-                    try {
-                        $optimalTransaction = unserialize($payment->getAdditionalInformation('transaction'));
-                        $cvvResultCode = $optimalTransaction->cvdVerification;
-                        $houseVerification = $optimalTransaction->houseNumberVerification;
-                        $zipVerification = $optimalTransaction->zipVerification;
-                        $avsResultCode = $houseVerification . ',' . $zipVerification;
-                    } catch (Exception $e) {
-                        Mage::helper('full/log')->log("optimal payment (" . $gatewayName . ") additional payment info failed to parse:" . $e->getMessage());
-                    }
-                    break;
-                case 'paypal_express':
-                case 'paypaluk_express':
-                case 'paypal_standard':
-                    $payer_email = $payment->getAdditionalInformation('paypal_payer_email');
-                    $payer_status = $payment->getAdditionalInformation('paypal_payer_status');
-                    $payer_address_status = $payment->getAdditionalInformation('paypal_address_status');
-                    $protection_eligibility = $payment->getAdditionalInformation('paypal_protection_eligibility');
-                    $payment_status = $payment->getAdditionalInformation('paypal_payment_status');
-                    $pending_reason = $payment->getAdditionalInformation('paypal_pending_reason');
-                    return new Model\PaymentDetails(array_filter(array(
-                        'authorization_id' => $transactionId,
-                        'payer_email' => $payer_email,
-                        'payer_status' => $payer_status,
-                        'payer_address_status' => $payer_address_status,
-                        'protection_eligibility' => $protection_eligibility,
-                        'payment_status' => $payment_status,
-                        'pending_reason' => $pending_reason
-                    ), 'strlen'));
-                case 'paypal_direct':
-                case 'paypaluk_direct':
-                    $avsResultCode = $payment->getAdditionalInformation('paypal_avs_code');
-                    $cvvResultCode = $payment->getAdditionalInformation('paypal_cvv2_match');
-                    $creditCardNumber = $payment->getCcLast4();
-                    $creditCardCompany = $payment->getCcType();
-                    break;
-                case 'sagepaydirectpro':
-                case 'sage_pay_form':
-                case 'sagepayserver':
-                    $sage = $model->getSagepayInfo();
-                    if ($sage) {
-                        $avsResultCode = $sage->getData('address_result');
-                        $cvvResultCode = $sage->getData('cv2result');
-                        $creditCardNumber = $sage->getData('last_four_digits');
-                        $creditCardCompany = $sage->getData('card_type');
-                        //Mage::helper('full/log')->log("sagepay payment (".$gatewayName.") additional info: ".PHP_EOL.var_export($sage->getAdditionalInformation(), 1));
-                        Mage::helper('full/log')->log("sagepay payment (" . $gatewayName . ") additional info: " . PHP_EOL . var_export($payment->getAdditionalInformation(), 1));
-                    } else {
-                        Mage::helper('full/log')->log("sagepay payment (" . $gatewayName . ") - getSagepayInfo returned null object");
-                    }
-                    break;
-
-                case 'transarmor':
-                    $avsResultCode = $payment->getAdditionalInformation('avs_response');
-                    $cvvResultCode = $payment->getAdditionalInformation('cvv2_response');
-                    Mage::helper('full/log')->log("transarmor payment additional info: " . PHP_EOL . var_export($payment->getAdditionalInformation(), 1));
-                    break;
-
-                case 'braintreevzero':
-                    $cvvResultCode = $payment->getAdditionalInformation('cvvResponseCode');
-                    $creditCardBin = $payment->getAdditionalInformation('bin');
-                    $houseVerification = $payment->getAdditionalInformation('avsStreetAddressResponseCode');
-                    $zipVerification = $payment->getAdditionalInformation('avsPostalCodeResponseCode');
-                    $avsResultCode = $houseVerification . ',' . $zipVerification;
-                    break;
-
-                case 'adyen_cc':
-                    $avsResultCode = $payment->getAdyenAvsResult();
-                    $cvvResultCode = $payment->getAdyenCvcResult();
-                    $transactionId = $payment->getAdyenPspReference();
-                    $creditCardBin = $payment->getAdyenCardBin();
-                    break;
-
-                default:
-                    Mage::helper('full/log')->log("unknown gateway:" . $gatewayName);
-                    Mage::helper('full/log')->log("Gateway payment (" . $gatewayName . ") additional info: " . PHP_EOL . var_export($payment->getAdditionalInformation(), 1));
-                    break;
-            }
-        } catch (Exception $e) {
-            Mage::helper('full/log')->logException($e);
-            Mage::getSingleton('adminhtml/session')->addError('Riskified extension: ' . $e->getMessage());
-        }
-
-        if (!isset($cvvResultCode)) {
-            $cvvResultCode = $payment->getCcCidStatus();
-        }
-        if (!isset($creditCardNumber)) {
-            $creditCardNumber = $payment->getCcLast4();
-        }
-        if (!isset($creditCardCompany)) {
-            $creditCardCompany = $payment->getCcType();
-        }
-        if (!isset($avsResultCode)) {
-            $avsResultCode = $payment->getCcAvsStatus();
-        }
-        if (!isset($creditCardBin)) {
-            $creditCardBin = $payment->getAdditionalInformation('riskified_cc_bin');
-        }
-        if (isset($creditCardNumber)) {
-            $creditCardNumber = "XXXX-XXXX-XXXX-" . $creditCardNumber;
-        }
-
-
-        return new Model\PaymentDetails(array_filter(array(
-            'authorization_id' => $transactionId,
-            'avs_result_code' => $avsResultCode,
-            'cvv_result_code' => $cvvResultCode,
-            'credit_card_number' => $creditCardNumber,
-            'credit_card_company' => $creditCardCompany,
-            'credit_card_bin' => $creditCardBin
-        ), 'strlen'));
-    }
-
     private function getLineItems($model)
     {
         $lineItems = array();
         foreach ($model->getAllVisibleItems() as $key => $val) {
-            $prodType = null;
-            $category = null;
-            $subCategories = null;
-            $brand = null;
-            $product = $val->getProduct();
-            if ($product) {
-                $prodType = $val->getProduct()->getTypeId();
-                $categoryIds = $product->getCategoryIds();
-                foreach ($categoryIds as $categoryId) {
-                    $cat = Mage::getModel('catalog/category')->load($categoryId);
-                    $catName = $cat->getName();
-                    if (!empty($catName)) {
-                        if (empty($category)) {
-                            $category = $catName;
-                        } else if (empty($subCategories)) {
-                            $subCategories = $catName;
-                        } else {
-                            $subCategories = $subCategories . '|' . $catName;
-                        }
-
-                    }
-                }
-
-
-                if ($product->getManufacturer()) {
-                    $brand = $product->getAttributeText('manufacturer');
-                }
-            }
-            $lineItems[] = new Model\LineItem(array_filter(array(
-                'price' => $val->getPrice(),
-                'quantity' => intval($val->getQtyOrdered()),
-                'title' => $val->getName(),
-                'sku' => $val->getSku(),
-                'product_id' => $val->getItemId(),
-                'grams' => $val->getWeight(),
-                'product_type' => $prodType,
-                'category' => $category,
-                'brand' => $brand,
-                //'sub_category' => $subCategories
-            ), 'strlen'));
+            $lineItems[] = $this->getLineItemData($val);
         }
 
         return $lineItems;
+    }
+
+    private function getAllLineItems($model)
+    {
+        $lineItems = array();
+        foreach ($model->getAllItems() as $key => $val) {
+            $lineItems[] = $this->getLineItemData($val);
+        }
+
+        return $lineItems;
+    }
+
+    private function getLineItemData($val)
+    {
+        $prodType = null;
+        $category = null;
+        $subCategories = null;
+        $brand = null;
+        $product = $val->getProduct();
+        if ($product) {
+            $prodType = $val->getProduct()->getTypeId();
+            $categoryIds = $product->getCategoryIds();
+            foreach ($categoryIds as $categoryId) {
+                $cat = Mage::getModel('catalog/category')->load($categoryId);
+                $catName = $cat->getName();
+                if (!empty($catName)) {
+                    if (empty($category)) {
+                        $category = $catName;
+                    } else if (empty($subCategories)) {
+                        $subCategories = $catName;
+                    } else {
+                        $subCategories = $subCategories . '|' . $catName;
+                    }
+
+                }
+            }
+
+
+            if ($product->getManufacturer()) {
+                $brand = $product->getAttributeText('manufacturer');
+            }
+        }
+
+        $lineItemData = new Model\LineItem(array_filter(array(
+            'price' => $val->getPrice(),
+            'quantity' => intval($val->getQtyOrdered()),
+            'title' => $val->getName(),
+            'sku' => $val->getSku(),
+            'product_id' => $val->getItemId(),
+            'grams' => $val->getWeight(),
+            'product_type' => $prodType,
+            'category' => $category,
+            'brand' => $brand,
+            //'sub_category' => $subCategories
+        ), 'strlen'));
+
+        return $lineItemData;
     }
 
     private function getShippingLines($model)
@@ -654,7 +577,7 @@ class Riskified_Full_Helper_Order extends Mage_Core_Helper_Abstract
     private function getClientDetails($model)
     {
         return new Model\ClientDetails(array_filter(array(
-            'accept_language' => Mage::app()->getLocale()->getLocaleCode(),
+            'accept_language' => Mage::helper('full')->getAcceptLanguage(),
             //'browser_ip' => $this->getRemoteIp($model),
             'user_agent' => Mage::helper('core/http')->getHttpUserAgent()
         ), 'strlen'));
